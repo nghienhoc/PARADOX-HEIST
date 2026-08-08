@@ -1,32 +1,42 @@
 import Phaser from 'phaser';
-import { EFFECTS, LOOP } from '@/config/balance';
-import { COLORS } from '@/config/theme';
+import { ACCESSIBILITY, EFFECTS, LOOP, OBJECTIVE, RESET_TOTAL_MS } from '@/config/balance';
+import { COLORS, DEPTH } from '@/config/theme';
+import type { Door } from '@/entities/Door';
+import type { DoorView } from '@/entities/DoorView';
 import type { Echo } from '@/entities/Echo';
+import { ExtractionZone } from '@/entities/ExtractionZone';
+import { ExtractionZoneView } from '@/entities/ExtractionZoneView';
 import { Player } from '@/entities/Player';
+import type { PressureSwitch } from '@/entities/PressureSwitch';
 import { Projectile, ProjectilePool } from '@/entities/Projectile';
 import { TimeCore } from '@/entities/TimeCore';
 import { TimeCoreView } from '@/entities/TimeCoreView';
 import { LEVEL_01 } from '@/levels/level01';
 import { buildLevel } from '@/levels/levelBuilder';
-import { SCENES } from '@/scenes/SceneKeys';
+import { REPLAY_EVENT, SCENES } from '@/scenes/SceneKeys';
+import type { ResultSceneData } from '@/scenes/ResultScene';
 import { EchoManager } from '@/systems/EchoManager';
 import { EffectsSystem } from '@/systems/EffectsSystem';
 import { InputSystem } from '@/systems/InputSystem';
 import { InteractionSystem } from '@/systems/InteractionSystem';
+import { LevelRun, objectiveLabel } from '@/systems/LevelRun';
 import { LoopManager } from '@/systems/LoopManager';
+import { SaveManager } from '@/systems/SaveManager';
 import { installTelemetry, telemetry } from '@/systems/Telemetry';
+import { TimelineResetVfx } from '@/systems/TimelineResetVfx';
 import type { Interactor } from '@/types/interaction';
 import type { LevelDef } from '@/types/level';
 import { DebugOverlay } from '@/ui/DebugOverlay';
 import { HUD } from '@/ui/HUD';
 import { clampDelta } from '@/utils/math';
+import { TEX } from '@/utils/textures';
 
 /**
  * The playable vault chamber.
  *
  * Orchestration only: the scene wires systems together and owns the timeline reset
- * sequence. Gameplay rules live in `systems/` and `entities/`, so this file does not
- * grow into the "one enormous GameScene" the spec warns about.
+ * sequence. Gameplay rules live in `systems/` and `entities/`, so this file does not grow
+ * into the "one enormous GameScene" the spec warns about.
  *
  * Note: the gameplay input wrapper is called `controls`, not `input` — `Scene.input` is
  * Phaser's own InputPlugin and must not be shadowed.
@@ -35,24 +45,36 @@ export class GameScene extends Phaser.Scene {
   private level!: LevelDef;
   private controls!: InputSystem;
   private loop!: LoopManager;
+  private run!: LevelRun;
   private player!: Player;
   private echoes!: EchoManager;
   private bullets!: ProjectilePool;
   private fx!: EffectsSystem;
   private hud!: HUD;
   private interactions!: InteractionSystem;
+  private resetVfx!: TimelineResetVfx;
+  private save!: SaveManager;
+
   private core!: TimeCore;
   private coreView!: TimeCoreView;
+  private carryRing!: Phaser.GameObjects.Image;
+  private extraction!: ExtractionZone;
+  private extractionView!: ExtractionZoneView;
+  private switches: PressureSwitch[] = [];
+  private doors: Door[] = [];
+  private doorViews: DoorView[] = [];
+
   private debug: DebugOverlay | null = null;
 
   /**
-   * Everyone who can act on the world this loop: the live player plus every active
-   * Echo. Rebuilt only when the Echo set changes, never per frame.
+   * Everyone who can act on the world this loop: the live player plus every active Echo.
+   * Rebuilt only when the Echo set changes, never per frame.
    */
   private readonly interactors: Interactor[] = [];
 
-  /** True during the reset transition; the clock and player input are frozen. */
+  /** True during the reset transition; the clock, physics and player input are frozen. */
   private transitioning = false;
+  private paused = false;
   private resetTimer: Phaser.Time.TimerEvent | null = null;
 
   constructor() {
@@ -63,14 +85,21 @@ export class GameScene extends Phaser.Scene {
     this.level = LEVEL_01;
     const built = buildLevel(this, this.level);
 
+    this.switches = built.switches;
+    this.doors = built.doors.map((d) => d.door);
+    this.doorViews = built.doors.map((d) => d.view);
+
     // Every timeline value comes from the level, never from a global constant.
     this.loop = new LoopManager(this.level.timeline);
+    this.run = new LevelRun(this.level.id, this.level.name, this.level.scoring);
+    this.save = new SaveManager();
 
     this.fx = new EffectsSystem(this);
     this.bullets = new ProjectilePool(this);
     this.echoes = new EchoManager(this, this.level.timeline.maxEchoes);
     this.hud = new HUD(this, this.level.timeline.loopDurationMs, this.level.timeline.maxEchoes);
     this.interactions = new InteractionSystem();
+    this.resetVfx = new TimelineResetVfx(this, this.fx);
 
     this.player = new Player(this, this.level.playerSpawn.x, this.level.playerSpawn.y);
     this.player.onFire = this.fireProjectile;
@@ -80,7 +109,12 @@ export class GameScene extends Phaser.Scene {
     this.echoes.onDash = this.onEchoDash;
     this.echoes.onInteract = this.onEchoInteract;
 
-    this.setupTimeCore();
+    this.setupObjective();
+
+    // Switches are registered after the Core so that an Interact press near both prefers
+    // whichever is genuinely nearest — the system resolves by distance, not order.
+    for (const mechanism of this.switches) this.interactions.register(mechanism);
+
     this.rebuildInteractors();
 
     // Frame 0 of timeline 1 must be the spawn pose, recorded before any time passes.
@@ -90,7 +124,9 @@ export class GameScene extends Phaser.Scene {
 
     // --- Collisions ---
     this.physics.add.collider(this.player, built.walls);
+    this.physics.add.collider(this.player, built.doorBodies);
     this.physics.add.collider(this.bullets.group, built.walls, this.onProjectileHitWall);
+    this.physics.add.collider(this.bullets.group, built.doorBodies, this.onProjectileHitWall);
 
     // --- Camera: soft follow with a small look-ahead toward the cursor. ---
     const camera = this.cameras.main;
@@ -104,6 +140,7 @@ export class GameScene extends Phaser.Scene {
 
     installTelemetry();
 
+    this.game.events.on(REPLAY_EVENT, this.restartLevel, this);
     this.events.once(Phaser.Scenes.Events.SHUTDOWN, this.onShutdown, this);
   }
 
@@ -111,18 +148,23 @@ export class GameScene extends Phaser.Scene {
     const delta = clampDelta(rawDeltaMs, LOOP.maxDeltaMs);
 
     this.controls.update(nowMs);
-    this.fx.update(delta);
-    this.bullets.update(nowMs);
 
-    if (!this.transitioning) {
-      if (this.core.isLevelComplete) {
-        // Level finished: the clock is stopped, but R restarts the whole level so the
-        // player can immediately try for a cleaner solution.
-        if (this.controls.justPressed('resetTimeline')) this.restartLevel();
-      } else {
+    if (this.controls.justPressed('pause') && !this.transitioning && !this.run.isComplete) {
+      this.togglePause();
+    }
+
+    if (!this.paused) {
+      this.fx.update(delta);
+      this.resetVfx.update(delta);
+      this.bullets.update(this.time.now);
+      for (const view of this.doorViews) view.update(delta);
+
+      if (!this.transitioning && !this.run.isComplete) {
         this.simulateLoop(nowMs, delta);
       }
     }
+
+    this.updateCarryRing();
 
     this.hud.update(
       {
@@ -132,6 +174,8 @@ export class GameScene extends Phaser.Scene {
         echoCount: this.loop.echoCount,
         dashCooldownRatio: this.player.dashCooldownRatio(nowMs),
         objective: this.describeObjective(),
+        carryingCore: this.core.isCollected,
+        paused: this.paused,
       },
       delta,
     );
@@ -146,24 +190,9 @@ export class GameScene extends Phaser.Scene {
     this.publishTelemetry();
   }
 
-  /** Mirror key state into the read-only telemetry snapshot. See `Telemetry.ts`. */
-  private publishTelemetry(): void {
-    const t = telemetry();
-    t.loopNumber = this.loop.loopNumber;
-    t.echoCount = this.loop.echoCount;
-    t.maxEchoes = this.loop.maxEchoes;
-    t.loopRemainingMs = this.loop.clock.remainingMs;
-    t.loopDurationMs = this.loop.loopDurationMs;
-    t.playerX = this.player.x;
-    t.playerY = this.player.y;
-    t.coreX = this.core.x;
-    t.coreY = this.core.y;
-    t.coreCollected = this.core.isCollected;
-    t.levelComplete = this.core.isLevelComplete;
-  }
-
-  /** One tick of live gameplay: player, recording, Echo playback, interactions. */
+  /** One tick of live gameplay: player, recording, Echo playback, mechanisms. */
   private simulateLoop(nowMs: number, delta: number): void {
+    this.run.tick(delta);
     this.player.tick(nowMs, delta, this.controls);
 
     // Record first, then replay: Echoes must be driven by the same loop time the live
@@ -173,11 +202,18 @@ export class GameScene extends Phaser.Scene {
 
     this.echoes.tick(this.loop.clock.elapsedMs, delta);
 
-    // Presence pass runs after Echo playback so plates and pickups see this frame's
+    // Presence pass runs after Echo playback so plates and pads see this frame's
     // positions, not last frame's.
     this.interactions.update(this.interactors);
 
+    // Mechanisms settle after the presence pass: doors read switch state, and the
+    // extraction pad syncs its visuals from its derived armed state.
+    for (const door of this.doors) door.update();
+    this.extraction.refresh();
+
     this.applyCameraLookAhead();
+
+    if (this.run.isComplete) return; // Extraction fired this frame; do not also reset.
 
     if (expired) {
       this.startTimelineReset('expired');
@@ -190,38 +226,146 @@ export class GameScene extends Phaser.Scene {
   // Objective
   // ---------------------------------------------------------------------------
 
-  private setupTimeCore(): void {
+  private setupObjective(): void {
     this.core = new TimeCore(
       this.level.core.x,
       this.level.core.y,
       this.level.completeOnCoreCollected,
+      OBJECTIVE.coreCollectRadius,
     );
     this.coreView = new TimeCoreView(this, this.level.core.x, this.level.core.y);
 
+    // Possession is represented by state + HUD badge + this ring, rather than a physical
+    // carried object — clear enough for the level, and far less to go wrong.
+    this.carryRing = this.add
+      .image(0, 0, TEX.glow)
+      .setDepth(DEPTH.player - 1)
+      .setBlendMode(Phaser.BlendModes.ADD)
+      .setTint(COLORS.gold)
+      .setScale(0.9)
+      .setVisible(false);
+
     this.core.onCollected = (): void => {
       this.coreView.showCollected();
-      this.fx.pulse(this.core.x, this.core.y, COLORS.gold, 0.6, 3.4, 380);
-      this.fx.burst(this.core.x, this.core.y, 22, COLORS.gold, 300, 520, 1.1);
-      this.cameras.main.shake(180, EFFECTS.shakeDefault * 1.2);
-      this.hud.showNotice('TIME CORE SECURED');
+      this.fx.pulse(this.core.x, this.core.y, COLORS.gold, 0.6, 3.2, 360);
+      this.fx.burst(this.core.x, this.core.y, 16, COLORS.gold, 300, 480, 1.05);
+      this.shake(170, EFFECTS.shakeDefault * 1.1);
+      this.hud.showNotice('TIME CORE SECURED — REACH EXTRACTION');
     };
 
     this.core.onRestored = (): void => {
       this.coreView.showRestored();
     };
 
-    this.core.onLevelCompleted = (): void => {
-      this.hud.setBanner('PARADOX COMPLETE\n\npress R to replay');
-      this.cameras.main.flash(260, 255, 210, 87, false);
-    };
+    // Only used by levels where touching the Core is itself the win condition.
+    this.core.onLevelCompleted = (): void => this.completeLevel();
 
     this.interactions.register(this.core);
+
+    // --- Extraction ---
+    const radius = this.level.extraction.radius ?? OBJECTIVE.extractionRadius;
+    this.extraction = new ExtractionZone(
+      this.level.extraction.x,
+      this.level.extraction.y,
+      radius,
+      () => this.core.isCollected,
+    );
+    this.extractionView = new ExtractionZoneView(
+      this,
+      this.level.extraction.x,
+      this.level.extraction.y,
+      radius,
+    );
+
+    this.extraction.onArmedChange = (armed): void => {
+      this.extractionView.setArmed(armed);
+      if (armed) {
+        this.fx.pulse(this.extraction.x, this.extraction.y, COLORS.gold, 0.4, 3.0, 420);
+      }
+    };
+
+    this.extraction.onExtracted = (): void => this.completeLevel();
+
+    this.interactions.register(this.extraction);
   }
 
   private describeObjective(): string {
-    if (this.core.isLevelComplete) return 'Complete.';
-    if (this.core.isCollected) return 'Time Core secured.';
-    return this.level.objective;
+    return objectiveLabel({
+      loopNumber: this.loop.loopNumber,
+      switchHeld: this.switches.some((s) => s.isHeld),
+      doorOpen: this.doors.some((d) => d.isOpen),
+      coreCollected: this.core.isCollected,
+      complete: this.run.isComplete,
+    });
+  }
+
+  private updateCarryRing(): void {
+    if (!this.core.isCollected) {
+      if (this.carryRing.visible) this.carryRing.setVisible(false);
+      return;
+    }
+    this.carryRing.setVisible(true).setPosition(this.player.x, this.player.y);
+    // Gentle breathing scale, computed rather than tweened so a reset cannot leave a
+    // tween running on a hidden object.
+    this.carryRing.setScale(0.85 + Math.sin(this.time.now * 0.006) * 0.08);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Level completion
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Finish the level. Guarded twice over: `ExtractionZone` latches after one use, and
+   * `LevelRun.complete()` returns null if a result already exists.
+   */
+  private completeLevel(): void {
+    const result = this.run.complete(this.loop.loopNumber, this.loop.totalTimelinesCreated);
+    if (!result) return;
+
+    const previousBest = this.save.loadBest(this.level.id);
+    const isNewBest = this.save.submit(this.level.id, result);
+
+    this.hud.setBanner(null);
+    this.hud.showNotice('EXTRACTION COMPLETE', 1_200);
+
+    const camera = this.cameras.main;
+    camera.flash(260, 255, 210, 87, false);
+    this.shake(320, EFFECTS.shakeDefault * 2);
+    this.fx.pulse(this.player.x, this.player.y, COLORS.gold, 0.5, 5.5, 620);
+    this.fx.burst(this.player.x, this.player.y, 26, COLORS.gold, 420, 700, 1.2);
+
+    (this.player.body as Phaser.Physics.Arcade.Body).velocity.set(0, 0);
+    this.bullets.releaseAll();
+
+    // Short beat so the victory effect lands before the panel covers it.
+    this.time.delayedCall(700, () => {
+      this.scene.pause();
+      const data: ResultSceneData = { result, best: previousBest ?? null, isNewBest };
+      this.scene.launch(SCENES.result, data);
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Pause
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Freeze the world.
+   *
+   * `time.paused` is the important part: it stops the scene clock, so the loop timer,
+   * projectile lifetimes and any pending reset timer all hold rather than silently
+   * advancing while the player is away.
+   */
+  private togglePause(): void {
+    this.paused = !this.paused;
+    this.time.paused = this.paused;
+
+    if (this.paused) {
+      this.physics.world.pause();
+    } else {
+      this.physics.world.resume();
+      this.controls.clearBuffers();
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -236,8 +380,8 @@ export class GameScene extends Phaser.Scene {
   };
 
   /**
-   * Rebuild the interactor list. Called at level start and after each reset, because
-   * that is the only time the set of active Echoes changes.
+   * Rebuild the interactor list. Called at level start and after each reset, because that
+   * is the only time the set of active Echoes changes.
    */
   private rebuildInteractors(): void {
     this.interactors.length = 0;
@@ -250,27 +394,30 @@ export class GameScene extends Phaser.Scene {
   // ---------------------------------------------------------------------------
 
   /**
-   * Begin the reset transition. Guarded so spamming R cannot queue several resets.
-   *
-   * Kept deliberately short (`LOOP.resetTransitionMs`) — looping is the core verb of
-   * the game and must never feel like waiting.
+   * Begin the collapse. Guarded so spamming R cannot queue several resets, and so a reset
+   * can never fire once the level is over.
    */
   private startTimelineReset(reason: 'expired' | 'manual'): void {
-    if (this.transitioning) return;
+    if (this.transitioning || this.paused || this.run.isComplete) return;
     this.transitioning = true;
 
-    const camera = this.cameras.main;
-    camera.flash(140, 95, 240, 255, false);
-    camera.shake(160, reason === 'expired' ? 0.006 : 0.003);
+    if (reason === 'manual') this.run.recordManualReset();
 
-    // Signature beat: the collapsing timeline throws off a shockwave and shards.
-    this.fx.pulse(this.player.x, this.player.y, COLORS.cyan, 0.4, 4.2, 320);
-    this.fx.burst(this.player.x, this.player.y, 18, COLORS.cyan, 420, 380, 1.1);
-
+    // Freeze the simulation for the whole transition. Physics only — the scene clock must
+    // keep running or the delayedCall below would never fire.
+    this.physics.world.pause();
     (this.player.body as Phaser.Physics.Arcade.Body).velocity.set(0, 0);
 
+    this.resetVfx.play(
+      this.loop.recorder,
+      this.player.x,
+      this.player.y,
+      this.player.rotation,
+      reason === 'manual',
+    );
+
     this.resetTimer = this.time.delayedCall(
-      LOOP.resetTransitionMs,
+      RESET_TOTAL_MS,
       this.beginNextLoop,
       undefined,
       this,
@@ -288,10 +435,7 @@ export class GameScene extends Phaser.Scene {
 
       if (this.loop.evictedOnLastClose > 0) {
         // Never silent: the player is told which way the cap cut.
-        this.hud.showNotice(
-          `ECHO LIMIT ${this.loop.maxEchoes} — OLDEST TIMELINE DISCARDED`,
-          2200,
-        );
+        this.hud.showNotice(`ECHO LIMIT ${this.loop.maxEchoes} — OLDEST TIMELINE DISCARDED`, 2_200);
       }
     }
 
@@ -299,31 +443,49 @@ export class GameScene extends Phaser.Scene {
     // object is reused, which is what keeps the restart effectively instant.
     this.bullets.releaseAll();
     this.fx.clear();
+    this.resetVfx.stop();
     this.echoes.restartAll();
     this.interactions.resetForLoop();
+    for (const door of this.doors) door.resetForLoop();
     this.controls.clearBuffers();
     this.player.respawn(this.level.playerSpawn.x, this.level.playerSpawn.y);
     this.loop.primeRecording(this.player.readSampleState());
 
-    this.fx.pulse(this.player.x, this.player.y, COLORS.echo, 2.6, 0.3, 260);
+    this.resetVfx.playMaterialise(this.player.x, this.player.y);
 
+    this.physics.world.resume();
     this.transitioning = false;
   }
 
-  /** Full level restart: wipes every timeline and permanent progress. */
+  /** Full level restart: wipes every timeline, the run stats and permanent progress. */
   private restartLevel(): void {
+    this.resetTimer?.remove(false);
+    this.resetTimer = null;
+
     this.loop.clear();
+    this.run.reset();
     this.echoes.clear();
     this.bullets.releaseAll();
     this.fx.clear();
+    this.resetVfx.stop();
+
     this.core.resetLevel();
+    this.extraction.resetLevel();
     this.interactions.resetForLoop();
+    for (const door of this.doors) door.resetForLoop();
+
     this.controls.clearBuffers();
     this.hud.clearTransients();
     this.player.respawn(this.level.playerSpawn.x, this.level.playerSpawn.y);
     this.loop.primeRecording(this.player.readSampleState());
     this.rebuildInteractors();
 
+    this.paused = false;
+    this.time.paused = false;
+    this.transitioning = false;
+    this.physics.world.resume();
+
+    this.cameras.main.setZoom(1);
     this.cameras.main.flash(200, 95, 240, 255, false);
   }
 
@@ -364,9 +526,7 @@ export class GameScene extends Phaser.Scene {
     this.fx.pulse(x, y, color, 0.7, 0.1, 90);
     this.fx.burst(x, y, 3, color, 180, 130, 0.5, 0.7, angle);
 
-    if (!fromEcho) {
-      this.cameras.main.shake(60, EFFECTS.shakeDefault * 0.4);
-    }
+    if (!fromEcho) this.shake(60, EFFECTS.shakeDefault * 0.4);
   }
 
   // ---------------------------------------------------------------------------
@@ -384,20 +544,66 @@ export class GameScene extends Phaser.Scene {
     );
   }
 
+  /** Shake, scaled by the accessibility setting so it can be reduced or disabled. */
+  private shake(durationMs: number, intensity: number): void {
+    if (ACCESSIBILITY.shakeScale <= 0) return;
+    this.cameras.main.shake(durationMs, intensity * ACCESSIBILITY.shakeScale);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Telemetry
+  // ---------------------------------------------------------------------------
+
+  /** Mirror key state into the read-only telemetry snapshot. See `Telemetry.ts`. */
+  private publishTelemetry(): void {
+    const t = telemetry();
+    t.loopNumber = this.loop.loopNumber;
+    t.echoCount = this.loop.echoCount;
+    t.maxEchoes = this.loop.maxEchoes;
+    t.loopRemainingMs = this.loop.clock.remainingMs;
+    t.loopDurationMs = this.loop.loopDurationMs;
+    t.playerX = this.player.x;
+    t.playerY = this.player.y;
+    t.coreX = this.core.x;
+    t.coreY = this.core.y;
+    t.coreCollected = this.core.isCollected;
+    t.switchHeld = this.switches.some((s) => s.isHeld);
+    t.switchX = this.switches[0]?.x ?? 0;
+    t.switchY = this.switches[0]?.y ?? 0;
+    t.doorOpen = this.doors.some((d) => d.isOpen);
+    const firstDoor = this.doors[0];
+    t.doorX = firstDoor ? firstDoor.x + firstDoor.width / 2 : 0;
+    t.doorY = firstDoor ? firstDoor.y + firstDoor.height / 2 : 0;
+    t.extractionArmed = this.extraction.isArmed;
+    t.extractionX = this.extraction.x;
+    t.extractionY = this.extraction.y;
+    t.levelComplete = this.run.isComplete;
+    t.paused = this.paused;
+    t.objective = this.describeObjective();
+    t.grade = this.run.finalResult?.grade ?? '';
+    t.timelinesUsed = this.run.finalResult?.timelinesUsed ?? 0;
+  }
+
   // ---------------------------------------------------------------------------
   // Teardown
   // ---------------------------------------------------------------------------
 
   /** Make sure nothing outlives the scene (spec §17 "Memory"). */
   private onShutdown(): void {
+    this.game.events.off(REPLAY_EVENT, this.restartLevel, this);
     this.resetTimer?.remove(false);
     this.resetTimer = null;
     this.tweens.killAll();
     this.time.removeAllEvents();
+    this.time.paused = false;
     this.controls.destroy();
+    this.resetVfx.destroy();
     this.echoes.clear();
     this.loop.clear();
     this.interactions.clear();
     this.interactors.length = 0;
+    this.switches = [];
+    this.doors = [];
+    this.doorViews = [];
   }
 }

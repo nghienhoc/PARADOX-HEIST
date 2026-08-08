@@ -60,6 +60,14 @@ export class LoopManager {
   }
 
   /**
+   * Timelines archived over the whole run, including ones later evicted by the Echo cap.
+   * This is the "Echoes created" run statistic, distinct from the live `echoCount`.
+   */
+  get totalTimelinesCreated(): number {
+    return this.nextTimelineId - 1;
+  }
+
+  /**
    * Record frame 0 with the loop's true starting state.
    *
    * Must be called once at the start of every loop, before the first `tick`. Without

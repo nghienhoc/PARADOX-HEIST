@@ -20,6 +20,9 @@ export interface HudState {
   echoCount: number;
   dashCooldownRatio: number;
   objective: string;
+  /** True while the player is carrying the Time Core. */
+  carryingCore: boolean;
+  paused: boolean;
 }
 
 /**
@@ -38,12 +41,16 @@ export class HUD {
   private readonly objectiveText: Phaser.GameObjects.Text;
   private readonly noticeText: Phaser.GameObjects.Text;
   private readonly bannerText: Phaser.GameObjects.Text;
+  private readonly coreBadge: Phaser.GameObjects.Text;
+  private readonly pauseText: Phaser.GameObjects.Text;
 
   private lastTimerLabel = '';
   private lastLoopLabel = '';
   private lastEchoLabel = '';
   private lastObjective = '';
   private warning = false;
+  private carrying = false;
+  private pausedShown = false;
   private noticeRemainingMs = 0;
 
   /**
@@ -144,12 +151,37 @@ export class HUD {
       .setDepth(DEPTH.hud)
       .setVisible(false);
 
+    // Carried-Core badge: possession is represented in state + HUD + a ring around the
+    // player, rather than a physical carried object.
+    this.coreBadge = scene.add
+      .text(GAME_WIDTH - 24, 46, '◆ TIME CORE', {
+        fontFamily: MONO,
+        fontSize: '14px',
+        color: toCss(COLORS.gold),
+      })
+      .setOrigin(1, 0.5)
+      .setScrollFactor(0)
+      .setDepth(DEPTH.hud)
+      .setVisible(false);
+
+    this.pauseText = scene.add
+      .text(GAME_WIDTH / 2, GAME_HEIGHT / 2, 'PAUSED\n\nESC to resume', {
+        fontFamily: MONO,
+        fontSize: '32px',
+        color: toCss(COLORS.cyan),
+        align: 'center',
+      })
+      .setOrigin(0.5, 0.5)
+      .setScrollFactor(0)
+      .setDepth(DEPTH.transition)
+      .setVisible(false);
+
     // Control guide + dash label — static, created once and never touched again.
     scene.add
       .text(
         GAME_WIDTH / 2,
         GAME_HEIGHT - 14,
-        'WASD move   ·   MOUSE aim   ·   LMB shoot   ·   SPACE dash   ·   E interact   ·   R reset timeline',
+        'WASD move   ·   MOUSE aim   ·   LMB shoot   ·   SPACE dash   ·   E interact   ·   R reset   ·   ESC pause',
         { fontFamily: MONO, fontSize: '13px', color: toCss(COLORS.hudText) },
       )
       .setOrigin(0.5, 1)
@@ -214,6 +246,16 @@ export class HUD {
       this.lastObjective = state.objective;
     }
 
+    if (state.carryingCore !== this.carrying) {
+      this.carrying = state.carryingCore;
+      this.coreBadge.setVisible(state.carryingCore);
+    }
+
+    if (state.paused !== this.pausedShown) {
+      this.pausedShown = state.paused;
+      this.pauseText.setVisible(state.paused);
+    }
+
     // --- Transient notice fade-out. ---
     if (this.noticeRemainingMs > 0) {
       this.noticeRemainingMs -= deltaMs;
@@ -248,5 +290,9 @@ export class HUD {
     this.noticeRemainingMs = 0;
     this.noticeText.setAlpha(0);
     this.setBanner(null);
+    this.coreBadge.setVisible(false);
+    this.carrying = false;
+    this.pauseText.setVisible(false);
+    this.pausedShown = false;
   }
 }

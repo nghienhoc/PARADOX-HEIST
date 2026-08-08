@@ -31,7 +31,7 @@ export class Echo extends Phaser.GameObjects.Sprite implements Interactor {
   /** Base opacity for this Echo, derived from its age. */
   private baseAlpha: number = ECHO_VISUALS.alphaNewest;
   /** Cached each tick: false once this timeline's recording has run out. */
-  private presentNow = false;
+  private replaying = false;
 
   constructor(
     scene: Phaser.Scene,
@@ -54,15 +54,30 @@ export class Echo extends Phaser.GameObjects.Sprite implements Interactor {
   }
 
   /**
-   * False when this Echo's recording has ended.
+   * True for as long as this slot has a timeline bound to it.
    *
-   * An Echo only exists in the world for as long as its timeline recorded it. If the
-   * player manually reset after 3 seconds, that Echo holds a switch for 3 seconds and
-   * then stops counting — which is the honest reading of the recording, and teaches
-   * the player that letting a loop run matters.
+   * An Echo whose recording has run out **holds its final pose and keeps interacting**.
+   * This is a deliberate design decision, and it reverses the earlier rule that a finished
+   * Echo stopped counting:
+   *
+   * - It turns the manual reset into a *positioning tool* — "walk onto the plate, press R,
+   *   and my past self is standing there" — instead of a waiting game where the player has
+   *   to idle on a switch for most of a loop before resetting is worth anything.
+   * - It matches the game's fantasy: a timeline that ended standing on a switch left
+   *   somebody standing on that switch.
+   * - It satisfies the spec's rule that a failed timeline must still feel useful
+   *   (MASTER_GAME_SPEC.md §4) rather than evaporating and wasting the loop.
+   *
+   * `isPresent` stays on the interface because it is still the hook for an unbound slot,
+   * and for the boss phase that temporarily hides an Echo (spec §8).
    */
   get isPresent(): boolean {
-    return this.active && this.presentNow;
+    return this.active;
+  }
+
+  /** True once playback has passed the recording's end and the Echo is holding still. */
+  get isHoldingFinalPose(): boolean {
+    return this.active && !this.replaying;
   }
 
   /**
@@ -88,7 +103,7 @@ export class Echo extends Phaser.GameObjects.Sprite implements Interactor {
     if (!this.cursor) return;
     this.cursor.reset();
     this.trail.clear();
-    this.presentNow = true;
+    this.replaying = true;
 
     // Brief materialisation so a new timeline announces itself.
     this.setScale(1.6);
@@ -103,7 +118,7 @@ export class Echo extends Phaser.GameObjects.Sprite implements Interactor {
 
   deactivate(): void {
     this.cursor = null;
-    this.presentNow = false;
+    this.replaying = false;
     this.trail.clear();
     this.setActive(false).setVisible(false);
     this.marker.setActive(false).setVisible(false);
@@ -118,7 +133,7 @@ export class Echo extends Phaser.GameObjects.Sprite implements Interactor {
 
     const fired = this.cursor.update(loopTimeMs, this.pose);
     const finished = this.cursor.isFinished(loopTimeMs);
-    this.presentNow = !finished;
+    this.replaying = !finished;
 
     this.setPosition(this.pose.x, this.pose.y);
     this.setRotation(this.pose.rotation);
@@ -133,13 +148,20 @@ export class Echo extends Phaser.GameObjects.Sprite implements Interactor {
       this.scaleY + (targetScaleY - this.scaleY) * k,
     );
 
-    // Fade back once the recording has run past its end, so a short timeline does not
-    // stand frozen — and looks visibly "no longer here" while it is not interacting.
-    const targetAlpha = finished ? this.baseAlpha * 0.28 : this.baseAlpha;
+    // Settle back slightly once the recording ends. Only slightly: the Echo is still
+    // standing there and still holding switches, so it must not read as gone.
+    const targetAlpha = finished ? this.baseAlpha * 0.8 : this.baseAlpha;
     this.setAlpha(this.alpha + (targetAlpha - this.alpha) * k);
 
     this.marker.setPosition(this.pose.x, this.pose.y - 26).setAlpha(this.alpha * 0.9);
-    this.trail.update(this.pose.x, this.pose.y, this.pose.rotation, this.alpha, deltaMs);
+
+    // No trail once it has stopped moving — a stationary Echo stamping afterimages on top
+    // of itself just looks like a rendering bug.
+    if (finished) {
+      this.trail.clear();
+    } else {
+      this.trail.update(this.pose.x, this.pose.y, this.pose.rotation, this.alpha, deltaMs);
+    }
 
     return fired;
   }

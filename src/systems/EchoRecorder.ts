@@ -78,6 +78,22 @@ export class EchoRecorder {
   }
 
   /**
+   * Read a recorded frame without copying it.
+   *
+   * The returned object is the recorder's own buffer entry and will be overwritten on a
+   * later loop — read its fields immediately, never retain it. Used by the timeline-reset
+   * effect to place its afterimages on the player's genuine recorded path.
+   *
+   * @param index Frame index, or a negative value counting back from the newest frame
+   *   (-1 is the most recent).
+   */
+  frameAt(index: number): EchoFrame | undefined {
+    const resolved = index < 0 ? this.nextIndex + index : index;
+    if (resolved < 0 || resolved >= this.nextIndex) return undefined;
+    return this.buffer[resolved];
+  }
+
+  /**
    * Write every sample slot whose scheduled time has been reached.
    *
    * @param loopTimeMs Current loop time from `LoopClock`.

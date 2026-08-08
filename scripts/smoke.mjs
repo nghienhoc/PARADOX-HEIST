@@ -1,21 +1,20 @@
 /**
  * Browser smoke test for the production build.
  *
- * Unit tests (`npm test`) cover the timeline and interaction logic in isolation; this
- * checks what they cannot — that the built bundle boots a real Phaser game, renders,
- * and that the Echo mechanic and Time Core pickup actually work when wired together.
+ * Unit tests (`npm test`) cover the timeline, mechanism and scoring logic in isolation;
+ * this checks what they cannot — that the built bundle boots a real Phaser game and that
+ * Level 01 can actually be *played* to completion: create an Echo, let it hold the
+ * pressure switch, walk through the opened door, take the Time Core, reach extraction.
  *
- * Game state is read through the read-only telemetry snapshot (see
- * `src/systems/Telemetry.ts`), which also lets us steer the player accurately instead
- * of guessing key-hold durations.
- *
- * Uses Vite's JS API rather than spawning a CLI, which keeps it portable across
- * platforms and avoids Windows' `npx` spawn restrictions.
+ * State is read through the read-only telemetry snapshot (`src/systems/Telemetry.ts`),
+ * which also lets us steer the player accurately instead of guessing key-hold durations.
+ * See `scripts/lib/drive.mjs` for why nothing here sleeps for a fixed duration.
  *
  * Usage:  npm run build && npm run smoke
  */
 import { chromium } from 'playwright';
 import { preview } from 'vite';
+import { createDriver, RENDER_ARGS } from './lib/drive.mjs';
 
 const failures = [];
 
@@ -34,13 +33,7 @@ try {
   const url = server.resolvedUrls?.local?.[0];
   if (!url) throw new Error('vite preview did not report a local URL');
 
-  // Headless Chromium renders at ~18 FPS on the default software path; SwiftShader
-  // roughly doubles that. Phaser's delta clamp then correctly runs the simulation in
-  // slow motion rather than fast-forwarding, so scripted input covers less ground than
-  // it would at 60 FPS. All waits below are generous for that reason.
-  browser = await chromium.launch({
-    args: ['--use-gl=angle', '--use-angle=swiftshader', '--enable-gpu-rasterization'],
-  });
+  browser = await chromium.launch({ args: RENDER_ARGS });
   const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
 
   const consoleErrors = [];
@@ -51,33 +44,17 @@ try {
 
   console.log(`Loading ${url}`);
   await page.goto(url, { waitUntil: 'load' });
-
   await page.waitForSelector('#game-root canvas', { timeout: 15_000 });
   await page.waitForTimeout(2_000);
 
-  const readState = () => page.evaluate(() => globalThis.paradoxHeist?.state ?? null);
-
-  /**
-   * Poll telemetry until `predicate` holds, or give up.
-   *
-   * Fixed sleeps are unusable here: headless frame rate varies with machine load, and
-   * Phaser's delta clamp turns a slow frame rate into slow motion, so the wall-clock
-   * duration of the 220ms reset transition is not predictable. Polling state is.
-   */
-  const waitForState = async (predicate, timeoutMs = 20_000) => {
-    const deadline = Date.now() + timeoutMs;
-    let last = await readState();
-    while (Date.now() < deadline) {
-      if (last && predicate(last)) return last;
-      await page.waitForTimeout(100);
-      last = await readState();
-    }
-    return last;
-  };
+  const { readState, waitForState, hold, releaseAll, distTo, walkTo, walkToPoint } =
+    createDriver(page);
 
   console.log('\nChecks:');
 
-  // --- Boot ---
+  // ==========================================================================
+  // Boot
+  // ==========================================================================
   const canvas = await page.evaluate(() => {
     const el = document.querySelector('#game-root canvas');
     return el ? { w: el.width, h: el.height } : null;
@@ -88,8 +65,7 @@ try {
     canvas ? `${canvas.w}x${canvas.h}` : 'no canvas',
   );
 
-  // A blank or solid-colour frame compresses to a couple of KB; a rendered vault with a
-  // floor grid, walls, glow and HUD text does not.
+  // A blank or solid-colour frame compresses to a couple of KB; a rendered vault does not.
   const before = await page.screenshot();
   check(
     'canvas renders a non-trivial frame',
@@ -106,120 +82,195 @@ try {
     `${initial?.loopDurationMs} ms`,
   );
   check('Echo cap comes from the level', initial?.maxEchoes === 3, `max ${initial?.maxEchoes}`);
+  check('door starts closed', initial?.doorOpen === false);
+  check('extraction starts disarmed', initial?.extractionArmed === false);
+  check(
+    'opening objective is shown',
+    initial?.objective === 'FIND A WAY THROUGH THE VAULT',
+    initial?.objective,
+  );
 
-  // --- Input drives the simulation ---
+  // ==========================================================================
+  // Input drives the simulation
+  // ==========================================================================
   await page.mouse.move(900, 300);
-  for (const key of ['KeyW', 'KeyA', 'KeyS', 'KeyD']) {
-    await page.keyboard.down(key);
-    await page.waitForTimeout(150);
-    await page.keyboard.up(key);
-  }
-  await page.mouse.down();
+  await page.keyboard.down('KeyD');
   await page.waitForTimeout(400);
+  await page.keyboard.up('KeyD');
+  await page.mouse.down();
+  await page.waitForTimeout(300);
   await page.mouse.up();
   await page.keyboard.press('Space');
   await page.waitForTimeout(300);
 
-  const afterInput = await page.screenshot();
-  check('frame changes after input (the game is simulating)', !before.equals(afterInput));
-
   const moved = await readState();
-  check(
-    'the player actually moved',
-    Math.abs(moved.playerX - initial.playerX) + Math.abs(moved.playerY - initial.playerY) > 5,
-  );
+  check('the player actually moved', Math.abs(moved.playerX - initial.playerX) > 5);
   check('the loop timer counts down', moved.loopRemainingMs < initial.loopRemainingMs);
+  check('frame changes after input', !before.equals(await page.screenshot()));
 
-  // --- One reset creates exactly one Echo ---
+  // ==========================================================================
+  // LOOP 1 — hold the switch, prove the door tracks it, then collapse the timeline
+  // ==========================================================================
+  const onSwitch = await walkTo((s) => ({ x: s.switchX, y: s.switchY }), (s) => s.switchHeld);
+  check('the player can hold the pressure switch', onSwitch.switchHeld === true);
+  check('holding the switch opens the door', onSwitch.doorOpen === true);
+
+  // Step off: the door must shut again. This is what makes the level unsolvable alone.
+  await hold('KeyS', true);
+  const steppedOff = await waitForState((s) => !s.switchHeld, 10_000);
+  await releaseAll();
+  check('stepping off the switch closes the door', steppedOff.doorOpen === false);
+
+  // Back on the plate, then reset while standing on it — the intended play.
+  await walkTo((s) => ({ x: s.switchX, y: s.switchY }), (s) => s.switchHeld);
   await page.keyboard.press('KeyR');
-  const afterOneReset = await waitForState((s) => s.loopNumber === 2);
-  check('a reset creates exactly one Echo', afterOneReset.echoCount === 1, `count ${afterOneReset.echoCount}`);
-  check('a reset advances the timeline counter', afterOneReset.loopNumber === 2);
-  check('a reset restarts the loop clock', afterOneReset.loopRemainingMs > moved.loopRemainingMs);
 
-  // --- Echoes accumulate up to the level cap, then hold steady ---
-  // Wait for each reset to land before triggering the next. A reset pressed inside the
-  // 220ms transition window is deliberately ignored (so a held R cannot queue resets),
-  // and that window is unpredictably long in wall-clock terms at headless frame rates.
-  let afterManyResets = afterOneReset;
-  for (let target = 3; target <= 6; target++) {
+  const loop2 = await waitForState((s) => s.loopNumber === 2);
+  check('a reset creates exactly one Echo', loop2.echoCount === 1, `count ${loop2.echoCount}`);
+  check('the reset restarts the loop clock', loop2.loopRemainingMs > 19_000);
+
+  // ==========================================================================
+  // LOOP 2 — the Echo holds the switch; the player runs the heist
+  // ==========================================================================
+  // Wait at the doorway, deliberately nowhere near the plate, so a held switch can only be
+  // the Echo's doing.
+  const atDoor = await walkToPoint((s) => ({ x: s.doorX - 70, y: s.doorY }), 45);
+  check(
+    'the player waits at the door, far from the switch',
+    distTo(atDoor, atDoor.switchX, atDoor.switchY) > 250,
+    `${distTo(atDoor, atDoor.switchX, atDoor.switchY).toFixed(0)} px from the switch`,
+  );
+
+  const echoHolding = await waitForState((s) => s.switchHeld && s.doorOpen, 40_000);
+  check('the Echo holds the pressure switch on its own', echoHolding.switchHeld === true);
+  check('the Echo opening the switch opens the door', echoHolding.doorOpen === true);
+  check(
+    'the player is still nowhere near the switch',
+    distTo(echoHolding, echoHolding.switchX, echoHolding.switchY) > 250,
+  );
+
+  const withEcho = await page.screenshot();
+  check(
+    'renders with an Echo replaying',
+    withEcho.length > 20_000,
+    `${(withEcho.length / 1024).toFixed(1)} KB PNG`,
+  );
+
+  // Route through the doorway — greedy steering cannot find a gap in a wall.
+  await walkToPoint((s) => ({ x: s.doorX + 60, y: s.doorY }), 45);
+  const gotCore = await walkTo((s) => ({ x: s.coreX, y: s.coreY }), (s) => s.coreCollected);
+  check('the player can reach and collect the Time Core', gotCore.coreCollected === true);
+  check('collecting the Core arms extraction', gotCore.extractionArmed === true);
+  check('objective advances to extraction', gotCore.objective === 'REACH EXTRACTION', gotCore.objective);
+  check('the level is not complete just from the pickup', gotCore.levelComplete === false);
+
+  const done = await walkTo(
+    (s) => ({ x: s.extractionX, y: s.extractionY }),
+    (s) => s.levelComplete,
+  );
+  check('reaching extraction completes the level', done.levelComplete === true);
+  check('completed in 2 timelines', done.timelinesUsed === 2, `${done.timelinesUsed} timelines`);
+  check('the intended solution earns top marks', done.grade === 'S', done.grade);
+
+  // ==========================================================================
+  // Result screen and replay
+  // ==========================================================================
+  await page.waitForTimeout(2_200);
+  const resultShot = await page.screenshot();
+  check(
+    'the result screen renders',
+    resultShot.length > 20_000,
+    `${(resultShot.length / 1024).toFixed(1)} KB PNG`,
+  );
+
+  await page.keyboard.press('KeyR');
+  const replayed = await waitForState((s) => s.loopNumber === 1 && !s.levelComplete);
+  check(
+    'REPLAY restarts the level cleanly',
+    replayed.loopNumber === 1 &&
+      replayed.echoCount === 0 &&
+      replayed.levelComplete === false &&
+      replayed.coreCollected === false &&
+      replayed.doorOpen === false,
+    `timeline ${replayed.loopNumber}, echoes ${replayed.echoCount}`,
+  );
+  check('the replayed run counts down again', replayed.loopRemainingMs > 15_000);
+
+  // ==========================================================================
+  // Pause must stop the clock
+  // ==========================================================================
+  await page.keyboard.press('Escape');
+  const paused = await waitForState((s) => s.paused, 8_000);
+  check('Escape pauses the game', paused.paused === true);
+
+  const pausedAt = paused.loopRemainingMs;
+  await page.waitForTimeout(1_800);
+  const stillPaused = await readState();
+  check(
+    'the loop timer does not advance while paused',
+    Math.abs(stillPaused.loopRemainingMs - pausedAt) < 1,
+    `${pausedAt.toFixed(1)} -> ${stillPaused.loopRemainingMs.toFixed(1)} ms`,
+  );
+
+  await page.keyboard.press('Escape');
+  const resumed = await waitForState((s) => !s.paused, 8_000);
+  check('Escape resumes the game', resumed.paused === false);
+
+  // ==========================================================================
+  // Resetting while carrying the Core must put it back
+  // ==========================================================================
+  // Re-run the two-timeline solution far enough to hold the Core again.
+  await walkTo((s) => ({ x: s.switchX, y: s.switchY }), (s) => s.switchHeld);
+  await page.keyboard.press('KeyR');
+  await waitForState((s) => s.loopNumber === 3);
+
+  await walkToPoint((s) => ({ x: s.doorX - 70, y: s.doorY }), 45);
+  await waitForState((s) => s.switchHeld && s.doorOpen, 40_000);
+  await walkToPoint((s) => ({ x: s.doorX + 60, y: s.doorY }), 45);
+  const carrying = await walkTo((s) => ({ x: s.coreX, y: s.coreY }), (s) => s.coreCollected);
+  check('the Core can be collected again after a replay', carrying.coreCollected === true);
+
+  await page.keyboard.press('KeyR');
+  const afterCarryReset = await waitForState((s) => s.loopNumber === 4);
+  check(
+    'a reset while carrying the Core restores it',
+    afterCarryReset.coreCollected === false,
+    `collected=${afterCarryReset.coreCollected}`,
+  );
+  check('extraction disarms when the Core goes back', afterCarryReset.extractionArmed === false);
+  check(
+    'the objective falls back from extraction',
+    afterCarryReset.objective !== 'REACH EXTRACTION',
+    afterCarryReset.objective,
+  );
+
+  // ==========================================================================
+  // Timer expiry must collapse the timeline on its own
+  // ==========================================================================
+  // Stand still and let the clock run out. Slow motion in headless makes a 20s loop take
+  // roughly a minute of wall time, hence the generous budget.
+  const expired = await waitForState((s) => s.loopNumber === 5, 150_000);
+  check('the loop collapses on its own when the timer expires', expired.loopNumber === 5);
+  check(
+    'an expired timeline still becomes an Echo',
+    expired.echoCount === 3,
+    `count ${expired.echoCount} / max ${expired.maxEchoes}`,
+  );
+
+  // ==========================================================================
+  // Echo cap holds under repeated resets
+  // ==========================================================================
+  let capState = expired;
+  for (let target = 6; target <= 8; target++) {
     await page.keyboard.press('KeyR');
-    afterManyResets = await waitForState((s) => s.loopNumber === target);
+    capState = await waitForState((s) => s.loopNumber === target);
   }
   check(
-    'Echo count is capped at the level maximum',
-    afterManyResets.echoCount === 3,
-    `count ${afterManyResets.echoCount} / max ${afterManyResets.maxEchoes}`,
+    'Echo count stays capped at the level maximum',
+    capState.echoCount === 3,
+    `count ${capState.echoCount} / max ${capState.maxEchoes}`,
   );
-  check(
-    'every reset registers, and the counter climbs past the Echo cap',
-    afterManyResets.loopNumber === 6,
-    `timeline ${afterManyResets.loopNumber} after 5 resets`,
-  );
-
-  const withEchoes = await page.screenshot();
-  check(
-    'still renders with multiple Echoes replaying',
-    withEchoes.length > 20_000,
-    `${(withEchoes.length / 1024).toFixed(1)} KB PNG`,
-  );
-
-  // --- Time Core pickup: steer the player to it using live telemetry ---
-  const held = new Set();
-  const hold = async (key, want) => {
-    if (want && !held.has(key)) {
-      await page.keyboard.down(key);
-      held.add(key);
-    } else if (!want && held.has(key)) {
-      await page.keyboard.up(key);
-      held.delete(key);
-    }
-  };
-
-  let collected = false;
-  const deadline = Date.now() + 60_000;
-  while (Date.now() < deadline) {
-    const s = await readState();
-    if (s.coreCollected) {
-      collected = true;
-      break;
-    }
-    // Greedy steering with a deadband. Sliding along walls handles the one obstacle
-    // between the spawn and the Core.
-    const dx = s.coreX - s.playerX;
-    const dy = s.coreY - s.playerY;
-    await hold('KeyD', dx > 12);
-    await hold('KeyA', dx < -12);
-    await hold('KeyS', dy > 12);
-    await hold('KeyW', dy < -12);
-    await page.waitForTimeout(120);
-  }
-  for (const key of [...held]) await hold(key, false);
-  await page.waitForTimeout(600);
-
-  check('the player can collect the Time Core', collected);
-
-  const completed = await readState();
-  check('collecting the Core completes the level', completed.levelComplete === true);
-
-  const afterWin = await page.screenshot();
-  check(
-    'the completion state renders',
-    afterWin.length > 20_000,
-    `${(afterWin.length / 1024).toFixed(1)} KB PNG`,
-  );
-
-  // --- R after completion restarts the level cleanly ---
-  await page.keyboard.press('KeyR');
-  const afterRestart = await waitForState((s) => s.loopNumber === 1 && !s.levelComplete);
-  check(
-    'R restarts the level after completion',
-    afterRestart.loopNumber === 1 &&
-      afterRestart.echoCount === 0 &&
-      afterRestart.levelComplete === false &&
-      afterRestart.coreCollected === false,
-    `timeline ${afterRestart.loopNumber}, echoes ${afterRestart.echoCount}`,
-  );
+  check('the timeline counter keeps climbing past the cap', capState.loopNumber === 8);
 
   check(
     'no console or page errors',

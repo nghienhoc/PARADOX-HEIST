@@ -3,8 +3,9 @@ import './style.css';
 import { createGameConfig } from '@/config/gameConfig';
 import { BootScene } from '@/scenes/BootScene';
 import { GameScene } from '@/scenes/GameScene';
+import { ResultScene } from '@/scenes/ResultScene';
 
-const game = new Phaser.Game(createGameConfig([BootScene, GameScene]));
+const game = new Phaser.Game(createGameConfig([BootScene, GameScene, ResultScene]));
 
 // Pause the simulation while the tab is hidden. Without this, returning to the tab
 // would replay the accumulated time and desynchronise the loop clock.

@@ -15,6 +15,10 @@ export const TEX = {
   floorTile: 'tex-floor-tile',
   wall: 'tex-wall',
   core: 'tex-core',
+  switchOff: 'tex-switch-off',
+  switchOn: 'tex-switch-on',
+  doorBarrier: 'tex-door-barrier',
+  extractionPad: 'tex-extraction-pad',
 } as const;
 
 /** Draw the shared agent silhouette (body + aim nose) pointing along +X. */
@@ -137,6 +141,63 @@ export function createTextures(scene: Phaser.Scene): void {
     );
     g.fillStyle(COLORS.white, 0.9);
     g.fillCircle(18, 18, 4);
+  });
+
+  // --- Pressure switch: two distinct textures, so the state is unmistakable rather
+  //     than a subtle tint change. Octagonal plate reads as machinery, not decoration.
+  const plate = (base: number, ring: number, glyph: number, ringWidth: number): void => {
+    const c = 36;
+    const octagon = (r: number): Phaser.Geom.Point[] => {
+      const points: Phaser.Geom.Point[] = [];
+      for (let i = 0; i < 8; i++) {
+        const a = (Math.PI / 4) * i + Math.PI / 8;
+        points.push(new Phaser.Geom.Point(c + Math.cos(a) * r, c + Math.sin(a) * r));
+      }
+      return points;
+    };
+
+    g.fillStyle(base, 0.85);
+    g.fillPoints(octagon(32), true);
+    g.lineStyle(ringWidth, ring, 1);
+    g.strokePoints(octagon(32), true);
+    g.lineStyle(2, ring, 0.7);
+    g.strokePoints(octagon(22), true);
+    g.fillStyle(glyph, 0.95);
+    g.fillCircle(c, c, 7);
+  };
+
+  bake(TEX.switchOff, 72, 72, () => plate(COLORS.floorLine, COLORS.hudDim, COLORS.hudDim, 3));
+  bake(TEX.switchOn, 72, 72, () => plate(COLORS.cyanDeep, COLORS.cyan, COLORS.white, 4));
+
+  // --- Door barrier: horizontal energy bands, stretched to fit the doorway and tinted
+  //     red while locked. Banding makes the retract animation legible.
+  bake(TEX.doorBarrier, 16, 16, () => {
+    g.fillStyle(0xffffff, 0.32);
+    g.fillRect(0, 0, 16, 16);
+    g.fillStyle(0xffffff, 0.85);
+    g.fillRect(0, 2, 16, 3);
+    g.fillStyle(0xffffff, 0.55);
+    g.fillRect(0, 9, 16, 2);
+  });
+
+  // --- Extraction pad: concentric rings, tinted per state.
+  bake(TEX.extractionPad, 120, 120, () => {
+    const c = 60;
+    g.lineStyle(4, 0xffffff, 0.9);
+    g.strokeCircle(c, c, 52);
+    g.lineStyle(2, 0xffffff, 0.55);
+    g.strokeCircle(c, c, 38);
+    g.lineStyle(2, 0xffffff, 0.35);
+    g.strokeCircle(c, c, 24);
+    // Corner ticks give it an "engineered pad" silhouette rather than a plain target.
+    g.lineStyle(4, 0xffffff, 0.8);
+    for (let i = 0; i < 4; i++) {
+      const a = (Math.PI / 2) * i + Math.PI / 4;
+      g.beginPath();
+      g.moveTo(c + Math.cos(a) * 44, c + Math.sin(a) * 44);
+      g.lineTo(c + Math.cos(a) * 58, c + Math.sin(a) * 58);
+      g.strokePath();
+    }
   });
 
   g.destroy();

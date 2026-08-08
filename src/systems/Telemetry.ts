@@ -27,7 +27,23 @@ export interface TelemetryState {
   coreX: number;
   coreY: number;
   coreCollected: boolean;
+  switchHeld: boolean;
+  switchX: number;
+  switchY: number;
+  doorOpen: boolean;
+  /** Centre of the first door — the only route between chambers in Level 01. */
+  doorX: number;
+  doorY: number;
+  extractionArmed: boolean;
+  extractionX: number;
+  extractionY: number;
   levelComplete: boolean;
+  paused: boolean;
+  objective: string;
+  /** Grade once the level is finished, otherwise an empty string. */
+  grade: string;
+  /** Timelines used once the level is finished, otherwise 0. */
+  timelinesUsed: number;
 }
 
 const state: TelemetryState = {
@@ -41,7 +57,20 @@ const state: TelemetryState = {
   coreX: 0,
   coreY: 0,
   coreCollected: false,
+  switchHeld: false,
+  switchX: 0,
+  switchY: 0,
+  doorOpen: false,
+  doorX: 0,
+  doorY: 0,
+  extractionArmed: false,
+  extractionX: 0,
+  extractionY: 0,
   levelComplete: false,
+  paused: false,
+  objective: '',
+  grade: '',
+  timelinesUsed: 0,
 };
 
 /** The live snapshot. Mutated in place — read fields, never retain the object. */
