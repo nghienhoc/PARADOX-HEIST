@@ -1,0 +1,43 @@
+:root {
+  color-scheme: dark;
+  --void: #05070f;
+  --cyan: #5ff0ff;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--void);
+  color: var(--cyan);
+  font-family: ui-monospace, 'SF Mono', 'Cascadia Mono', Consolas, monospace;
+}
+
+#game-root {
+  display: grid;
+  place-items: center;
+  width: 100vw;
+  height: 100vh;
+  /* Subtle vignette so the canvas edge does not read as a hard cut. */
+  background:
+    radial-gradient(ellipse at center, #0a0f22 0%, var(--void) 70%),
+    var(--void);
+}
+
+#game-root canvas {
+  display: block;
+  /* Controlled outer glow; the in-canvas art carries the rest of the look. */
+  box-shadow: 0 0 60px rgba(95, 240, 255, 0.08);
+}
+
+noscript {
+  display: block;
+  padding: 2rem;
+  text-align: center;
+}
